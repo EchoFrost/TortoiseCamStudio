@@ -1,9 +1,10 @@
-const onvif = require("node-onvif");
-const tmi = require("tmi.js");
 const fs = require("fs");
+const path = require("path");
+const tmi = require("tmi.js");
+const onvif = require("node-onvif");
 
-const cameraConfig = JSON.parse(fs.readFileSync("./cameraConfig.json"));
-const twitchConfig = JSON.parse(fs.readFileSync("./twitchConfig.json"));
+// Get our configurations.
+const { cameraConfig, channelName, commandPrefix, validChannelRewardIds } = require("./config.json");
 
 // Create an OnvifDevice object
 const device = new onvif.OnvifDevice(cameraConfig);
@@ -14,39 +15,71 @@ device
   .then(() => {
     // Get the UDP stream URL
     let url = device.getUdpStreamUrl();
-    console.log(url);
+    console.log("Device UDP stream url:\n", url);
   })
   .catch((error) => {
     console.error(error);
   });
 
+// Create a TMI Client object
 const client = new tmi.Client({
   connection: {
     secure: true,
     reconnect: true,
   },
-  channels: [twitchConfig.channelName],
+  channels: [channelName],
 });
 
+// Make an anonymous channel connection
 client.connect();
 
-client.on("message", (channel, tags, message, self) => {
-  console.log(`${tags["display-name"]}: ${message}`);
-  let params = {
-    speed: {
-      x: 1.0, // Speed of pan (in the range of -1.0 to 1.0)
-      y: 0.0, // Speed of tilt (in the range of -1.0 to 1.0)
-      z: 0.0, // Speed of zoom (in the range of -1.0 to 1.0)
-    },
-    timeout: 1, // seconds
-  };
-  // Move the camera
-  device
-    .ptzMove(params)
-    .then(() => {
-      console.log("Done!");
-    })
-    .catch((error) => {
-      console.error(error);
+const commands = new Map();
+const commandsDir = path.resolve(__dirname, "commands");
+const commandFiles = fs.readdirSync(commandsDir);
+
+commandFiles.forEach((file) => {
+  const commandPath = path.join(commandsDir, file);
+  const command = require(commandPath);
+  commands.set(command.name, command);
+});
+
+// Create a channel point redeem listener
+client.on("redeem", async (channel, username, type, tags, message) => {
+  const rewardId = tags["custom-reward-id"];
+
+  if (!rewardId || !validChannelRewardIds || !commandPrefix) {
+    return;
+  }
+
+  if (!validChannelRewardIds.includes(rewardId)) {
+    return;
+  }
+
+  if (!message.startsWith(commandPrefix)) {
+    return;
+  }
+
+  const commandString = message.substring(commandPrefix.length);
+  const [commandName, ...commandArgs] = commandString.trim().split(/ +/);
+
+  const command = commands.get(commandName.toLowerCase());
+  if (!command) {
+    return;
+  }
+
+  try {
+    await command.execute({
+      tmi: client,
+      device: device,
+      args: commandArgs,
+      tags: tags,
+      message: message,
+      userName: username,
     });
+  } catch (err) {
+    console.log("Error", {
+      command,
+      error: err,
+    });
+  }
 });
